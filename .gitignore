@@ -1,0 +1,27 @@
+# Python maxfiy fayllari
+.env
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+env/
+auth-service-DkGsl4g7-py3.12/
+
+# IDE sozlamalari
+.vscode/
+.idea/
+
+# Database va log fayllari
+*.log
+*.sql
+*.sqlite3
+
+# Boshqa
+.DS_Store
