@@ -1,84 +1,92 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Response
-from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
-from jose import JWTError, jwt
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from app.api.deps import get_current_user
+from app.core.config import settings
 from app.db.session import get_db
 from app.db.redis import get_redis
-from app.schemas.user import UserCreate, UserOut, Token
-from app.services.auth import create_user, authenticate_user, blacklist_token
-from app.utils.security import create_access_token, create_refresh_token
-from app.core.config import settings
 from app.models.user import User
+from app.schemas.user import UserOut, Token
+from app.utils.security import get_password_hash, verify_password
+from app.utils.jwt import create_access_token, create_refresh_token
 import redis.asyncio as redis
-
+from datetime import timedelta
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
-
 @router.post("/signup", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-async def signup(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
-    return await create_user(db, user_in)
+async def signup(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(select(User).filter(User.email == form_data.username))
+    user = result.scalars().first()
+    if user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
 
+    hashed_password = get_password_hash(form_data.password)
+    new_user = User(
+        email=form_data.username,
+        hashed_password=hashed_password,
+        is_active=True,
+        is_superuser=False
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+    return UserOut.from_orm(new_user)
 
 @router.post("/login", response_model=Token)
 async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db)
 ):
-    user = await authenticate_user(db, form_data.username, form_data.password)
-    access_token = create_access_token(data={"sub": user.email})
-    refresh_token = create_refresh_token(data={"sub": user.email})
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer"
-    }
+    result = await db.execute(select(User).filter(User.email == form_data.username))
+    user = result.scalars().first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
+    access_token = create_access_token(
+        data={"sub": user.email},
+        expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    refresh_token = create_refresh_token(
+        data={"sub": user.email},
+        expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
 
 @router.post("/refresh", response_model=Token)
-async def refresh_token(refresh_token: str, db: AsyncSession = Depends(get_db)):
-    try:
-        payload = jwt.decode(refresh_token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
-        email: str = payload.get("sub")
-        token_type: str = payload.get("type")
-        if email is None or token_type != "refresh":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    result = await db.execute(select(User).filter(User.email == email))
-    user = result.scalars().first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    new_access_token = create_access_token(data={"sub": user.email})
-    new_refresh_token = create_refresh_token(data={"sub": user.email})
-    return {
-        "access_token": new_access_token,
-        "refresh_token": new_refresh_token,
-        "token_type": "bearer"
-    }
-
+async def refresh_token(
+    current_user: UserOut = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    access_token = create_access_token(
+        data={"sub": current_user.email},
+        expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    refresh_token = create_refresh_token(
+        data={"sub": current_user.email},
+        expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
-    token: str = Depends(oauth2_scheme),
-    redis: redis.Redis = Depends(get_redis)
-
+    current_user: UserOut = Depends(get_current_user),
+    redis_client: redis.Redis = Depends(get_redis)
 ):
-    await blacklist_token(token, redis)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    # Access tokenni blacklist'ga qo'shish
+    await redis_client.setex(
+        f"blacklist:{current_user.access_token}",
+        int(timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES).total_seconds()),
+        "true"
+    )

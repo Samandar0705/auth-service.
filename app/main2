@@ -1,13 +1,14 @@
-import asyncio
-import redis.asyncio as redis
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 
-async def check_redis():
-    try:
-        r = redis.Redis(host='localhost', port=6379, decode_responses=True)
-        await r.set("test", "hello")
-        val = await r.get("test")
-        print("Redis ishlayapti:", val)
-    except Exception as e:
-        print("Xatolik:", e)
+# Parolni hash qilish uchun
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-asyncio.run(check_redis())
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+print(get_password_hash("1234"))
